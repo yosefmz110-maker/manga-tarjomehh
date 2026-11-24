@@ -2,6 +2,8 @@ package com.mangastudio.app.engine.translate
 
 import com.google.gson.Gson
 import com.google.gson.JsonArray
+import com.google.gson.JsonElement
+import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import com.mangastudio.app.core.model.BubbleType
 import com.mangastudio.app.core.model.GlossaryEntry
@@ -32,9 +34,9 @@ interface TranslatorEngine {
 object TranslatorFactory {
     private val sharedHttpClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
-            .connectTimeout(20, TimeUnit.SECONDS)
-            .readTimeout(45, TimeUnit.SECONDS)
-            .writeTimeout(20, TimeUnit.SECONDS)
+            .connectTimeout(25, TimeUnit.SECONDS)
+            .readTimeout(90, TimeUnit.SECONDS)
+            .writeTimeout(25, TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
             .build()
     }
@@ -177,8 +179,8 @@ class GoogleFreeBatchTranslator(
                 val idx = indices.first()
                 val rawTranslated = requestGoogleWithRetry(
                     text = protectedTexts[idx].first,
-                    sourceLang = settings.sourceLang,
-                    targetLang = settings.targetLang
+                    sourceLang = settings.sourceLang.trim().ifEmpty { "en" },
+                    targetLang = settings.targetLang.trim().ifEmpty { "fa" }
                 )
                 results[idx] = finalizeSingle(rawTranslated, protectedTexts[idx].second, settings.targetLang)
             } else {
@@ -192,8 +194,8 @@ class GoogleFreeBatchTranslator(
 
                 val rawBatchOutput = requestGoogleWithRetry(
                     text = combined,
-                    sourceLang = settings.sourceLang,
-                    targetLang = settings.targetLang
+                    sourceLang = settings.sourceLang.trim().ifEmpty { "en" },
+                    targetLang = settings.targetLang.trim().ifEmpty { "fa" }
                 )
                 val parsedMap = parseBatchMarkers(rawBatchOutput)
 
@@ -211,8 +213,8 @@ class GoogleFreeBatchTranslator(
                             delay(Random.nextLong(120L, 260L))
                             requestGoogleWithRetry(
                                 text = protectedTexts[globalIdx].first,
-                                sourceLang = settings.sourceLang,
-                                targetLang = settings.targetLang
+                                sourceLang = settings.sourceLang.trim().ifEmpty { "en" },
+                                targetLang = settings.targetLang.trim().ifEmpty { "fa" }
                             )
                         }
                         results[globalIdx] = finalizeSingle(translated, protectedTexts[globalIdx].second, settings.targetLang)
@@ -340,6 +342,12 @@ class OpenAiCompatibleTranslator(
     private val client: OkHttpClient
 ) : TranslatorEngine {
 
+    companion object {
+        private val keyCounter = AtomicInteger(0)
+        private val thinkBlockRegex = Regex("""(?is)<think>.*?</think>""")
+        private val codeFenceRegex = Regex("""(?i)```(?:json)?""")
+    }
+
     private val gson = Gson()
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
 
@@ -349,93 +357,292 @@ class OpenAiCompatibleTranslator(
     ): List<String> = withContext(Dispatchers.IO) {
         if (blocks.isEmpty()) return@withContext emptyList()
 
+        val rawUrl = settings.customApiBaseUrl.trim().trimEnd('/')
+        if (!rawUrl.startsWith("http://") && !rawUrl.startsWith("https://")) {
+            throw IOException("آدرس Base URL نامعتبر است (باید با https:// شروع شود).")
+        }
+        val endpoint = if (rawUrl.endsWith("/chat/completions")) rawUrl else "$rawUrl/chat/completions"
+        val modelName = settings.customModelName.trim().ifBlank { "gpt-4o-mini" }
+
+        // پشتیبانی از چند کلید API با کاما برای دور زدن محدودیت
+        val apiKeys = settings.customApiKey
+            .split(',', '\n', ';')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .ifEmpty { listOf("") }
+
         val toneGuide = when (settings.translationTone) {
-            TranslationTone.NATURAL_COLLOQUIAL -> "فارسی روان، طبیعی و محاوره‌ای مناسب کمیک و مانهوا"
+            TranslationTone.NATURAL_COLLOQUIAL -> "فارسی روان، طبیعی، صمیمی و محاوره‌ای (دقیقاً مثل تیم‌های ترجمه حرفه‌ای مانگا و مانهوا، نه کتابی)"
             TranslationTone.SEMI_FORMAL -> "فارسی نیمه‌رسمی و خوش‌خوان"
             TranslationTone.LITERARY -> "فارسی ادبی، حماسی و دقیق"
         }
 
         val glossaryNote = if (settings.glossary.isNotEmpty()) {
-            val pairs = settings.glossary.joinToString("\n") { "- ${it.source} => ${it.target}" }
+            val pairs = settings.glossary.joinToString("\n") { "- ${it.source} =>${it.target}" }
             "\nواژه‌نامه اجباری (دقیقاً مطابق این اسامی ترجمه کن):\n$pairs"
         } else {
             ""
         }
 
+        val srcLang = settings.sourceLang.trim().ifEmpty { "en" }
+        val dstLang = settings.targetLang.trim().ifEmpty { "fa" }
+
         val systemPrompt = """
             تو یک مترجم حرفه‌ای مانگا و مانهوا هستی.
-            متن‌های ورودی را از ${settings.sourceLang} به ${settings.targetLang} با لحن «$toneGuide» ترجمه کن.
-            قوانین:
+            آرایه JSON ورودی شامل دیالوگ‌های یک صفحه است. هر عنصر را از زبان $srcLang به $dstLang با لحن «$toneGuide» ترجمه کن.
+            قوانین خیلی مهم:
             1. هیچ دیالوگی را حذف یا خلاصه نکن.
-            2. لحن فریاد، نجوا، افکار و افکت صوتی (SFX) را حفظ کن.
-            3. خروجی فقط و فقط یک آرایه JSON معتبر از رشته‌ها با دقیقاً همان تعداد عناصر ورودی باشد و هیچ توضیح اضافه‌ای ننویس.
+            2. لحن فریاد، عصبانیت، شوخی، نجوا و افکت صوتی را طبیعی منتقل کن.
+            3. خروجی باید دقیقاً یک آرایه JSON از رشته‌ها (فقط متن ترجمه‌شده هر عنصر به همان ترتیب) باشد، مثل: ["ترجمه اول", "ترجمه دوم"]
+            4. هیچ توضیح اضافه، مقدمه یا برچسب [SHOUT] در خروجی ننویس.
             $glossaryNote
         """.trimIndent()
 
-        val inputItems = blocks.mapIndexed { idx, block ->
-            val typeTag = when (block.type) {
-                BubbleType.SHOUT -> "[SHOUT] "
-                BubbleType.SFX -> "[SFX] "
-                BubbleType.NARRATION -> "[NARRATION] "
-                BubbleType.THOUGHT -> "[THOUGHT] "
+        // ارسال مستقیم آرایه رشته‌ها تا مدل هم دقیقاً آرایه رشته برگرداند
+        val inputStrings = blocks.map { block ->
+            val prefix = when (block.type) {
+                BubbleType.SHOUT -> "(فریاد) "
+                BubbleType.SFX -> "(افکت صوتی) "
+                BubbleType.NARRATION -> "(راوی) "
+                BubbleType.THOUGHT -> "(فکر) "
                 BubbleType.DIALOGUE -> ""
             }
-            mapOf("index" to idx, "text" to "$typeTag${block.originalText}")
+            "$prefix${block.originalText}"
         }
 
         val payload = mapOf(
-            "model" to settings.customModelName.ifBlank { "gpt-4o-mini" },
-            "temperature" to 0.3,
+            "model" to modelName,
+            "temperature" to 0.35,
             "messages" to listOf(
                 mapOf("role" to "system", "content" to systemPrompt),
-                mapOf("role" to "user", "content" to gson.toJson(inputItems))
+                mapOf("role" to "user", "content" to gson.toJson(inputStrings))
             )
         )
+        val payloadJson = gson.toJson(payload)
 
-        val baseUrl = settings.customApiBaseUrl.trimEnd('/')
-        val endpoint = if (baseUrl.endsWith("/chat/completions")) baseUrl else "$baseUrl/chat/completions"
+        var lastError: Exception? = null
+        val maxAttempts = (apiKeys.size * 2).coerceIn(3, 6)
 
-        val reqBuilder = Request.Builder()
-            .url(endpoint)
-            .post(gson.toJson(payload).toRequestBody(jsonMediaType))
-            .header("Content-Type", "application/json")
+        for (attempt in 0 until maxAttempts) {
+            val currentKey = apiKeys[keyCounter.getAndIncrement().and(0x7FFFFFFF) % apiKeys.size]
 
-        if (settings.customApiKey.isNotBlank()) {
-            reqBuilder.header("Authorization", "Bearer ${settings.customApiKey.trim()}")
+            val reqBuilder = Request.Builder()
+                .url(endpoint)
+                .post(payloadJson.toRequestBody(jsonMediaType))
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json")
+                .header("HTTP-Referer", "[https://mangastudio.local](https://mangastudio.local)")
+                .header("X-Title", "Manga Studio")
+
+            if (currentKey.isNotEmpty()) {
+                reqBuilder.header("Authorization", "Bearer $currentKey")
+            }
+
+            try {
+                client.newCall(reqBuilder.build()).execute().use { response ->
+                    val bodyStr = response.body?.string().orEmpty()
+
+                    if (response.isSuccessful && bodyStr.isNotBlank()) {
+                        val content = extractAssistantContent(bodyStr)
+                        return@withContext parseFlexibleJsonOutput(content, blocks.size, dstLang)
+                    }
+
+                    val shortErr = extractApiErrorMessage(bodyStr)
+                    when (response.code) {
+                        401 -> {
+                            lastError = IOException("کد 401: کلید API اشتباه یا منقضی است ($shortErr)")
+                            if (apiKeys.size <= 1) throw lastError!!
+                        }
+                        403 -> {
+                            lastError = IOException("کد 403: دسترسی رد شد — فیلترشکن/IP یا مجوز کلید را چک کن ($shortErr)")
+                            if (apiKeys.size <= 1) throw lastError!!
+                        }
+                        404 -> {
+                            throw IOException("کد 404: آدرس Base URL یا نام مدل «$modelName» اشتباه است ($shortErr)")
+                        }
+                        429 -> {
+                            lastError = IOException("کد 429: محدودیت سرعت/سهمیه ($shortErr)")
+                            val retryAfterSec = response.header("Retry-After")?.toLongOrNull()
+                            val waitMs = if (retryAfterSec != null) {
+                                (retryAfterSec * 1000L).coerceIn(1500L, 20000L)
+                            } else {
+                                (2500L * (attempt + 1)).coerceAtMost(15000L)
+                            }
+                            delay(waitMs)
+                            continue
+                        }
+                        in 500..599 -> {
+                            lastError = IOException("کد ${response.code}: خطای موقت سرور ($shortErr)")
+                            delay(2000L * (attempt + 1))
+                            continue
+                        }
+                        else -> {
+                            throw IOException("خطای API (کد ${response.code}):$shortErr")
+                        }
+                    }
+                }
+            } catch (e: IOException) {
+                lastError = e
+                val msg = e.message.orEmpty()
+                // خطاهای قطعی (404 یا فرمت اشتباه) نیاز به تلاش مجدد ندارند
+                if (msg.startsWith("کد 404") || msg.startsWith("خطای API")) throw e
+                delay(1800L * (attempt + 1))
+            }
         }
 
-        client.newCall(reqBuilder.build()).execute().use { response ->
-            val bodyStr = response.body?.string().orEmpty()
-            if (!response.isSuccessful) {
-                throw IOException("خطای API ترجمه (کد ${response.code}): ${bodyStr.take(200)}")
-            }
-            val root = JsonParser.parseString(bodyStr).asJsonObject
-            val content = root
-                .getAsJsonArray("choices")[0].asJsonObject
-                .getAsJsonObject("message")
-                .get("content").asString
-                .trim()
+        throw lastError ?: IOException("خطای ناشناخته در ارتباط با سرور ترجمه")
+    }
 
-            parseJsonArrayOutput(content, blocks.size, settings.targetLang)
+    private fun extractAssistantContent(bodyStr: String): String {
+        val root = JsonParser.parseString(bodyStr).asJsonObject
+        val choices = root.getAsJsonArray("choices")
+            ?: throw IOException("پاسخ سرور فاقد choices است: ${bodyStr.take(160)}")
+        if (choices.size() == 0) {
+            throw IOException("مدل پاسخی برنگرداند (احتمالاً فیلتر محتوا فعال شده).")
+        }
+        val firstChoice = choices[0].asJsonObject
+        val messageObj = firstChoice.getAsJsonObject("message")
+            ?: throw IOException("پاسخ سرور فاقد message است.")
+        val contentEl = messageObj.get("content")
+        if (contentEl == null || contentEl.isJsonNull || !contentEl.isJsonPrimitive) {
+            throw IOException("متن پاسخ مدل خالی است (احتمالاً فیلتر ایمنی).")
+        }
+        return contentEl.asString.trim()
+    }
+
+    private fun extractApiErrorMessage(bodyStr: String): String {
+        if (bodyStr.isBlank()) return "پاسخ خالی"
+        return try {
+            val root = JsonParser.parseString(bodyStr)
+            if (root.isJsonObject) {
+                val obj = root.asJsonObject
+                val errEl = obj.get("error")
+                when {
+                    errEl != null && errEl.isJsonObject ->
+                        errEl.asJsonObject.get("message")?.asString ?: bodyStr.take(140)
+                    errEl != null && errEl.isJsonPrimitive -> errEl.asString
+                    obj.has("message") -> obj.get("message").asString
+                    else -> bodyStr.take(140)
+                }
+            } else {
+                bodyStr.take(140)
+            }
+        } catch (_: Exception) {
+            bodyStr.take(140)
         }
     }
 
-    private fun parseJsonArrayOutput(
+    /**
+     * پارسر هوشمند و مقاوم: هم آرایه رشته، هم آرایه آبجکت و هم آبجکت‌های پوششی را بی‌خطا می‌خواند
+     */
+    private fun parseFlexibleJsonOutput(
         rawContent: String,
         expectedCount: Int,
         targetLang: String
     ): List<String> {
-        val startIdx = rawContent.indexOf('[')
-        val endIdx = rawContent.lastIndexOf(']')
-        if (startIdx == -1 || endIdx <= startIdx) {
-            throw IOException("مدل خروجی JSON معتبر برنگرداند.")
+        val cleaned = rawContent
+            .replace(thinkBlockRegex, "")
+            .replace(codeFenceRegex, "")
+            .replace("```", "")
+            .trim()
+
+        val jsonArray = extractJsonArray(cleaned)
+            ?: return fallbackLineSplit(cleaned, expectedCount, targetLang)
+
+        val rawList = mutableListOf<String>()
+        for (el in jsonArray) {
+            val extracted = when {
+                el.isJsonNull -> ""
+                el.isJsonPrimitive -> el.asString
+                el.isJsonObject -> extractTextFromJsonObject(el.asJsonObject)
+                else -> ""
+            }
+            rawList.add(cleanLeadingTags(extracted))
         }
-        val jsonSlice = rawContent.substring(startIdx, endIdx + 1)
-        val arr: JsonArray = JsonParser.parseString(jsonSlice).asJsonArray
 
         return List(expectedCount) { i ->
-            val text = if (i < arr.size() && !arr[i].isJsonNull) arr[i].asString else ""
-            GlossaryAndPersianNormalizer.normalizePersian(text, targetLang)
+            val piece = rawList.getOrElse(i) { "" }
+            GlossaryAndPersianNormalizer.normalizePersian(piece, targetLang)
+        }
+    }
+
+    private fun extractJsonArray(text: String): JsonArray? {
+        // ۱. تلاش مستقیم برای پارس کل متن (اگر آرایه یا آبجکتِ حاوی آرایه باشد)
+        try {
+            val el = JsonParser.parseString(text)
+            unwrapArray(el)?.let { return it }
+        } catch (_: Exception) {
+        }
+
+        // ۲. استخراج بخش بین اولین [ و آخرین ]
+        val startArr = text.indexOf('[')
+        val endArr = text.lastIndexOf(']')
+        if (startArr != -1 && endArr > startArr) {
+            try {
+                val slice = text.substring(startArr, endArr + 1)
+                val parsed = JsonParser.parseString(slice)
+                if (parsed.isJsonArray) return parsed.asJsonArray
+            } catch (_: Exception) {
+            }
+        }
+
+        // ۳. استخراج بخش بین اولین { و آخرین }
+        val startObj = text.indexOf('{')
+        val endObj = text.lastIndexOf('}')
+        if (startObj != -1 && endObj > startObj) {
+            try {
+                val slice = text.substring(startObj, endObj + 1)
+                val parsed = JsonParser.parseString(slice)
+                unwrapArray(parsed)?.let { return it }
+            } catch (_: Exception) {
+            }
+        }
+
+        return null
+    }
+
+    private fun unwrapArray(el: JsonElement): JsonArray? {
+        if (el.isJsonArray) return el.asJsonArray
+        if (el.isJsonObject) {
+            for ((_, value) in el.asJsonObject.entrySet()) {
+                if (value.isJsonArray) return value.asJsonArray
+            }
+        }
+        return null
+    }
+
+    private fun extractTextFromJsonObject(obj: JsonObject): String {
+        val preferredKeys = listOf("translation", "translatedText", "translated", "fa", "text", "content", "value")
+        for (key in preferredKeys) {
+            val v = obj.get(key)
+            if (v != null && v.isJsonPrimitive && v.asJsonPrimitive.isString) {
+                return v.asString
+            }
+        }
+        for ((_, v) in obj.entrySet()) {
+            if (v.isJsonPrimitive && v.asJsonPrimitive.isString) {
+                return v.asString
+            }
+        }
+        return ""
+    }
+
+    private fun cleanLeadingTags(text: String): String {
+        return text
+            .replace(Regex("""^\s*\[(?:SHOUT|SFX|NARRATION|THOUGHT|DIALOGUE)]\s*""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""^\s*\((?:فریاد|افکت صوتی|راوی|فکر)\)\s*"""), "")
+            .trim()
+    }
+
+    private fun fallbackLineSplit(text: String, expectedCount: Int, targetLang: String): List<String> {
+        val lines = text.lines()
+            .map { it.replace(Regex("""^\s*\d+[\.\)\-:]\s*"""), "").trim() }
+            .filter { it.isNotEmpty() }
+        if (lines.isEmpty()) {
+            throw IOException("مدل خروجی قابل خواندن برنگرداند: ${text.take(120)}")
+        }
+        return List(expectedCount) { i ->
+            GlossaryAndPersianNormalizer.normalizePersian(lines.getOrElse(i) { "" }, targetLang)
         }
     }
 }
