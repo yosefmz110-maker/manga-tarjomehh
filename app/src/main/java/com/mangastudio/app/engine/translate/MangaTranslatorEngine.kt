@@ -284,4 +284,159 @@ class GoogleFreeBatchTranslator(
 
         for (attempt in 0 until 4) {
             val baseEndpoint = ENDPOINTS[endpointCounter.getAndIncrement().and(0x7FFFFFFF) % ENDPOINTS.size]
-            
+            val userAgent = USER_AGENTS[attempt % USER_AGENTS.size]
+
+            val url = "$baseEndpoint?client=gtx&sl=$sourceLang&tl=$targetLang&dt=t&ie=UTF-8&oe=UTF-8"
+            val body = FormBody.Builder()
+                .add("q", text)
+                .build()
+
+            val request = Request.Builder()
+                .url(url)
+                .post(body)
+                .header("User-Agent", userAgent)
+                .header("Accept", "application/json, text/plain, */*")
+                .build()
+
+            try {
+                client.newCall(request).execute().use { response ->
+                    val responseBody = response.body?.string().orEmpty()
+                    if (response.isSuccessful && responseBody.isNotBlank()) {
+                        return parseGoogleJson(responseBody)
+                    }
+                    lastError = IOException("HTTP ${response.code} از سرور گوگل ترنسلیت")
+                }
+            } catch (e: Exception) {
+                lastError = e
+            }
+
+            delay(500L * (attempt + 1) + Random.nextLong(100L, 350L))
+        }
+
+        throw IOException("خطا در ارتباط با موتور ترجمه: ${lastError?.message ?: "پاسخ نامعتبر"}")
+    }
+
+    private fun parseGoogleJson(jsonText: String): String {
+        val root = JsonParser.parseString(jsonText)
+        if (!root.isJsonArray) throw IOException("فرمت پاسخ ترجمه ناشناخته است.")
+        val outerArray = root.asJsonArray
+        if (outerArray.size() == 0 || !outerArray[0].isJsonArray) return ""
+
+        val segments = outerArray[0].asJsonArray
+        val sb = StringBuilder()
+        for (el in segments) {
+            if (el.isJsonArray) {
+                val arr = el.asJsonArray
+                if (arr.size() > 0 && !arr[0].isJsonNull) {
+                    sb.append(arr[0].asString)
+                }
+            }
+        }
+        return sb.toString()
+    }
+}
+
+class OpenAiCompatibleTranslator(
+    private val client: OkHttpClient
+) : TranslatorEngine {
+
+    private val gson = Gson()
+    private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
+
+    override suspend fun translateBlocks(
+        blocks: List<TextBlock>,
+        settings: StudioSettings
+    ): List<String> = withContext(Dispatchers.IO) {
+        if (blocks.isEmpty()) return@withContext emptyList()
+
+        val toneGuide = when (settings.translationTone) {
+            TranslationTone.NATURAL_COLLOQUIAL -> "فارسی روان، طبیعی و محاوره‌ای مناسب کمیک و مانهوا"
+            TranslationTone.SEMI_FORMAL -> "فارسی نیمه‌رسمی و خوش‌خوان"
+            TranslationTone.LITERARY -> "فارسی ادبی، حماسی و دقیق"
+        }
+
+        val glossaryNote = if (settings.glossary.isNotEmpty()) {
+            val pairs = settings.glossary.joinToString("\n") { "- ${it.source} => ${it.target}" }
+            "\nواژه‌نامه اجباری (دقیقاً مطابق این اسامی ترجمه کن):\n$pairs"
+        } else {
+            ""
+        }
+
+        val systemPrompt = """
+            تو یک مترجم حرفه‌ای مانگا و مانهوا هستی.
+            متن‌های ورودی را از ${settings.sourceLang} به ${settings.targetLang} با لحن «$toneGuide» ترجمه کن.
+            قوانین:
+            1. هیچ دیالوگی را حذف یا خلاصه نکن.
+            2. لحن فریاد، نجوا، افکار و افکت صوتی (SFX) را حفظ کن.
+            3. خروجی فقط و فقط یک آرایه JSON معتبر از رشته‌ها با دقیقاً همان تعداد عناصر ورودی باشد و هیچ توضیح اضافه‌ای ننویس.
+            $glossaryNote
+        """.trimIndent()
+
+        val inputItems = blocks.mapIndexed { idx, block ->
+            val typeTag = when (block.type) {
+                BubbleType.SHOUT -> "[SHOUT] "
+                BubbleType.SFX -> "[SFX] "
+                BubbleType.NARRATION -> "[NARRATION] "
+                BubbleType.THOUGHT -> "[THOUGHT] "
+                BubbleType.DIALOGUE -> ""
+            }
+            mapOf("index" to idx, "text" to "$typeTag${block.originalText}")
+        }
+
+        val payload = mapOf(
+            "model" to settings.customModelName.ifBlank { "gpt-4o-mini" },
+            "temperature" to 0.3,
+            "messages" to listOf(
+                mapOf("role" to "system", "content" to systemPrompt),
+                mapOf("role" to "user", "content" to gson.toJson(inputItems))
+            )
+        )
+
+        val baseUrl = settings.customApiBaseUrl.trimEnd('/')
+        val endpoint = if (baseUrl.endsWith("/chat/completions")) baseUrl else "$baseUrl/chat/completions"
+
+        val reqBuilder = Request.Builder()
+            .url(endpoint)
+            .post(gson.toJson(payload).toRequestBody(jsonMediaType))
+            .header("Content-Type", "application/json")
+
+        if (settings.customApiKey.isNotBlank()) {
+            reqBuilder.header("Authorization", "Bearer ${settings.customApiKey.trim()}")
+        }
+
+        client.newCall(reqBuilder.build()).execute().use { response ->
+            val bodyStr = response.body?.string().orEmpty()
+            if (!response.isSuccessful) {
+                throw IOException("خطای API ترجمه (کد ${response.code}): ${bodyStr.take(200)}")
+            }
+            val root = JsonParser.parseString(bodyStr).asJsonObject
+            val content = root
+                .getAsJsonArray("choices")[0].asJsonObject
+                .getAsJsonObject("message")
+                .get("content").asString
+                .trim()
+
+            parseJsonArrayOutput(content, blocks.size, settings.targetLang)
+        }
+    }
+
+    private fun parseJsonArrayOutput(
+        rawContent: String,
+        expectedCount: Int,
+        targetLang: String
+    ): List<String> {
+        val startIdx = rawContent.indexOf('[')
+        val endIdx = rawContent.lastIndexOf(']')
+        if (startIdx == -1 || endIdx <= startIdx) {
+            throw IOException("مدل خروجی JSON معتبر برنگرداند.")
+        }
+        val jsonSlice = rawContent.substring(startIdx, endIdx + 1)
+        val arr: JsonArray = JsonParser.parseString(jsonSlice).asJsonArray
+
+        return List(expectedCount) { i ->
+            val text = if (i < arr.size() && !arr[i].isJsonNull) arr[i].asString else ""
+            GlossaryAndPersianNormalizer.normalizePersian(text, targetLang)
+        }
+    }
+}
+// END_OF_FILE
